@@ -86,6 +86,7 @@ export interface PublishInput {
   env?: Record<string, string>;
   rollbackTo?: number;
   alwaysOn?: boolean;
+  public?: boolean;
   share?: Array<{ scope: ScopeId; permission: Permission }>;
 }
 
@@ -106,6 +107,7 @@ interface PublishResult {
   audience?: PublishAudienceDescriptor;
   dataDir?: string;
   alwaysOn?: boolean;
+  public?: boolean;
 }
 
 export class NeedsApproval extends Error {
@@ -213,6 +215,7 @@ export interface ToolContext extends SurfaceToolDeps {
   skill(name: string, opts?: { path?: string; sandboxId?: string; signal?: AbortSignal }): Promise<SkillResult>;
   write(path: string, data?: string, share?: ShareDirective[]): Promise<WriteResult>;
   publish(input: PublishInput): Promise<PublishResult>;
+  setDeploymentPublic(id: string, isPublic: boolean): Promise<{ id: string; name?: string; public: boolean }>;
   createPlayground(input: { title: string; html: string }): Promise<PlaygroundArtifact>;
   memorySearch(q: string, limit?: number): Promise<string[] | null>;
   memoryRead(): Promise<string | null>;
@@ -1063,6 +1066,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           ...(Object.keys(authEnv).length ? { stampEnv: authEnv } : {}),
           ...(input.rollbackTo !== undefined ? { rollbackTo: input.rollbackTo } : {}),
           ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
+          ...(input.public !== undefined ? { public: input.public } : {}),
           ...(doReconcile
             ? {
                 defaultAudience: {
@@ -1096,8 +1100,14 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           audience,
           ...(dataDir ? { dataDir } : {}),
           ...(d.alwaysOn ? { alwaysOn: true } : {}),
+          ...(d.public ? { public: true } : {}),
         };
       });
+    },
+
+    async setDeploymentPublic(id: string, isPublic: boolean) {
+      const d = await deps.deploy.setDeploymentPublic(id, isPublic, { createdBy: deps.createdBy });
+      return { id: d.id, ...(d.name ? { name: d.name } : {}), public: d.public === true };
     },
 
     async memorySearch(q: string, limit?: number): Promise<string[] | null> {

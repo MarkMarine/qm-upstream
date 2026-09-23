@@ -18,6 +18,7 @@ export interface DeploymentView {
   name?: string;
   displayName?: string;
   permission?: "read" | "write";
+  public?: boolean;
   createdAt?: number;
   updatedAt?: number;
   lastAccessAt?: number;

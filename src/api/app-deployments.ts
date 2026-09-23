@@ -26,6 +26,7 @@ export function createDeploymentMethods(
   | "renameDeployment"
   | "setDeploymentDisplayName"
   | "setDeploymentAlwaysOn"
+  | "setDeploymentPublic"
   | "keepAlwaysOnWarm"
   | "reachDeployment"
   | "deploymentLogsFor"
@@ -96,6 +97,9 @@ export function createDeploymentMethods(
     },
     setDeploymentAlwaysOn(id, alwaysOn) {
       return deps.deploy.setDeploymentAlwaysOn(id, alwaysOn);
+    },
+    setDeploymentPublic(idOrName, isPublic, actor) {
+      return deps.deploy.setDeploymentPublic(idOrName, isPublic, actor);
     },
     keepAlwaysOnWarm() {
       return deps.deploy.keepAlwaysOnWarm();

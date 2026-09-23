@@ -811,15 +811,17 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
     cleanUrlRedirect();
     return true;
   }
+  const deployment = await app.getDeployment(slug).catch(() => null);
+  const isPublic = deployment?.public === true;
   const sessionSecret = deps.deployAppsSessionSecret;
   const loginUrl = deps.deployAppsLoginUrl;
   const wantsHtml = ctx.method === "GET" && String(req.headers.accept ?? "").includes("text/html");
   const sub = sessionSecret ? portalSessionSub(req.headers.cookie, sessionSecret) : null;
-  if (!sessionSecret || !loginUrl) {
+  if (!isPublic && (!sessionSecret || !loginUrl)) {
     sendJson(res, 503, { error: "unavailable", message: "sign-in is not configured for deployment subdomains" });
     return true;
   }
-  if (!sub) {
+  if (!sub && !isPublic) {
     const qs = url.searchParams.toString();
     const returnTo = `https://${rawHost}${safePathname}?${qs ? `${qs}&` : ""}dpl_signin=1`;
     const signIn = `${loginUrl}${deps.deployAppsLoginPath ?? "/auth/login"}?returnTo=${encodeURIComponent(returnTo)}`;
@@ -842,13 +844,13 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
   url.searchParams.delete("__qm_no_shell");
   const isTopDocument = String(req.headers["sec-fetch-dest"] ?? "") === "document";
   const isShellRequest = pathname.startsWith(APP_SHELL_PATH_PREFIX);
-  const canManage = await app.canManageDeployment(slug, sub);
-  if (ctx.method === "GET" && ((!bareApp && isTopDocument) || isShellRequest) && canManage) {
+  const canManage = sub ? await app.canManageDeployment(slug, sub) : false;
+  const authenticatedPermission = sub && deployment ? await app.effectiveDeploymentPermission(deployment, sub) : null;
+  if (ctx.method === "GET" && ((!bareApp && isTopDocument) || isShellRequest) && canManage && loginUrl) {
     if (signInAttempted) {
       cleanUrlRedirect();
       return true;
     }
-    const deployment = await app.getDeployment(slug);
     if (isShellRequest) {
       if (pathname === "/__claw__/version" && deployment)
         sendJson(res, 200, { version: deployment.appliedVersion ?? deployment.currentVersion });
@@ -866,19 +868,20 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
     );
     return true;
   }
-  const reach = await app.reachDeployment(slug, sub, canManage ? { bypassAcl: true } : undefined);
+  const viewer = sub ?? "";
+  const reach = await app.reachDeployment(slug, viewer, canManage || isPublic ? { bypassAcl: true } : undefined);
   if (reach.status === "denied") {
     const owner = (await app.getDeployment(slug).catch(() => null))?.ownerScopeId;
     const ev = {
       at: Date.now(),
-      principalId: sub,
+      principalId: viewer,
       action: "deployment.reach_denied",
       resource: slug,
-      scopeLabel: owner ?? scopeId("personal", sub),
+      scopeLabel: owner ?? scopeId("personal", viewer),
       status: "denied",
     };
     const hour = Math.floor(ev.at / 3_600_000);
-    if (deps.auditLog?.recordOnce) await deps.auditLog.recordOnce(`reach_denied|${sub}|${slug}|${hour}`, ev);
+    if (deps.auditLog?.recordOnce) await deps.auditLog.recordOnce(`reach_denied|${viewer}|${slug}|${hour}`, ev);
     else deps.auditLog?.record(ev);
   }
   if (reach.status === "denied" && ctx.method === "POST" && pathname === REQUEST_ACCESS_PATH) {
@@ -895,11 +898,11 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
     const day = Math.floor(Date.now() / 86_400_000);
     try {
       await app.enqueueDelivery({
-        destination: principalDestination(ownerId, sub),
+        destination: principalDestination(ownerId, viewer),
         text:
-          `${sub} is asking for access to your app "${label}" (https://${rawHost}/). ` +
-          `They signed in but the app isn't shared with them. To grant it, share the deployment with personal:${sub}.`,
-        idempotencyKey: `deploy-access-request:${slug}:${sub}:${day}`,
+          `${viewer} is asking for access to your app "${label}" (https://${rawHost}/). ` +
+          `They signed in but the app isn't shared with them. To grant it, share the deployment with personal:${viewer}.`,
+        idempotencyKey: `deploy-access-request:${slug}:${viewer}:${day}`,
       });
       sendJson(res, 200, { ok: true });
     } catch {
@@ -913,14 +916,14 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
     });
-    res.end(notSharedHtml(sub));
+    res.end(notSharedHtml(viewer));
     return true;
   }
   if (reach.status === "ok" && signInAttempted && ctx.method === "GET") {
     cleanUrlRedirect();
     return true;
   }
-  await proxyReach(ctx, reach, pathname, sub);
+  await proxyReach(ctx, reach, pathname, sub && (canManage || authenticatedPermission) ? sub : undefined);
   return true;
 }
 
@@ -1450,14 +1453,52 @@ export async function getDeploymentShares(ctx: ApiCtx): Promise<void> {
   if (!deployment) return sendJson(res, 404, { error: "not_found" });
   if (deployment.ownerScopeId !== `personal:${capability.actorId}`)
     return sendJson(res, 403, { error: "forbidden", message: "Only the owner can edit app permissions." });
-  return sendJson(res, 200, { grantees: await app.deploymentGrantees(deployment.id) });
+  return sendJson(res, 200, {
+    public: deployment.public === true,
+    grantees: await app.deploymentGrantees(deployment.id),
+  });
 }
 
 export async function shareDeployment(ctx: ApiCtx): Promise<void> {
   const { res, app, params, body, capability } = ctx;
   if (!capability)
     return sendJson(res, 403, { error: "forbidden", message: "sharing requires an agent capability token" });
-  const b = (isObj(body) ? body : {}) as { scope?: unknown; recipient?: unknown; access?: unknown };
+  const b = (isObj(body) ? body : {}) as {
+    scope?: unknown;
+    recipient?: unknown;
+    access?: unknown;
+    public?: unknown;
+  };
+  if (b.public !== undefined) {
+    if (typeof b.public !== "boolean")
+      return sendJson(res, 400, { error: "bad_request", message: "public must be a boolean" });
+    if (b.scope !== undefined || b.recipient !== undefined || b.access !== undefined)
+      return sendJson(res, 400, {
+        error: "bad_request",
+        message: "public access and person/scope access must be changed separately",
+      });
+    try {
+      const deployment = await app.setDeploymentPublic(params.id!, b.public, { createdBy: capability.actorId });
+      return sendJson(res, 200, {
+        ok: true,
+        public: deployment.public === true,
+        reach: deployment.public === true ? "anyone with the link" : "restricted",
+        grantees: await app.deploymentGrantees(deployment.id),
+      });
+    } catch (e) {
+      const msg = errMessage(e);
+      let status = 400;
+      let error = "share_failed";
+      if (/no such app/.test(msg)) {
+        status = 404;
+        error = "not_found";
+      } else if (/only the owner/.test(msg)) {
+        status = 403;
+        error = "forbidden";
+      }
+      return sendJson(res, status, { error, message: msg });
+    }
+  }
   const access = typeof b.access === "string" ? b.access.toLowerCase() : "view";
   if (access !== "view" && access !== "manage" && access !== "none") {
     return sendJson(res, 400, { error: "bad_request", message: 'access must be "view", "manage", or "none"' });
@@ -1487,11 +1528,13 @@ export async function shareDeployment(ctx: ApiCtx): Promise<void> {
     let reach = "owner-only";
     if (orgGrant) reach = `everyone in ${parseScopeId(orgGrant.scope).ref}`;
     else if (grantees.length) reach = `${grantees.length} grantee${grantees.length === 1 ? "" : "s"}`;
+    const deployment = await app.getDeployment(params.id!);
     return sendJson(res, 200, {
       ok: true,
       target: { scope: target.scope, label: target.label },
       access,
       reach,
+      public: deployment?.public === true,
       grantees,
     });
   } catch (e) {
